@@ -1,0 +1,577 @@
+# Pipeline dedicado à réplica do cliente ISM.
+# Manter este arquivo e os manifests/scripts em ./.pipelines/ism-k8s-replica/; cadastrar YAML path /.pipelines/ism-k8s-replica/azure-pipelines-ism-prd.yml.
+# Push em ism-prd: bootstrap + um ECR + build/push somente dos componentes alterados; deploy opt-in mantém build completo.
+# PR para ism-prd: somente validação .NET, sem credenciais AWS/EKS.
+
+trigger:
+  branches:
+    include:
+      - ism-prd
+
+pr:
+  branches:
+    include:
+      - ism-prd
+
+resources:
+  repositories:
+    - repository: devops-templates
+      type: git
+      name: UZE - CRM/devops-templates
+      ref: refs/heads/main
+
+parameters:
+  - name: deployWorkloads
+    displayName: Deploy workloads ISM (habilitar somente após validar o Secret do database)
+    type: boolean
+    default: false
+
+pool:
+  vmImage: ubuntu-latest
+
+# Crie este Variable Group no Azure DevOps e autorize este pipeline.
+# Não inclua connection strings/tokens nele; os segredos da aplicação ficam no Secret Kubernetes/Secrets Manager.
+variables:
+  - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      - group: uze-collection-crm-ISM-PRD
+
+stages:
+  - stage: ValidatePR
+    displayName: Validate ISM pull request
+    dependsOn: []
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq(variables['System.PullRequest.TargetBranch'], 'refs/heads/ism-prd'))
+    jobs:
+      - job: CompileBackendPR
+        displayName: Compile backend only
+        steps:
+          - checkout: self
+          - template: dotnet/build.yml@devops-templates
+            parameters:
+              projectPath: backend
+
+  - stage: BootstrapISM
+    displayName: Bootstrap Kubernetes infrastructure for ISM
+    dependsOn: []
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/ism-prd'))
+    jobs:
+      - job: ApplyInfrastructure
+        displayName: Apply namespace, Services and Ingress
+        steps:
+          - checkout: self
+          - task: KubectlInstaller@0
+            inputs:
+              kubectlVersion: '1.34.9'
+          - task: AWSShellScript@1
+            displayName: Validate AWS/EKS target and apply ISM infrastructure
+            inputs:
+              awsCredentials: '$(awsCredentials)'
+              regionName: '$(awsRegion)'
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                cd "$(Build.SourcesDirectory)"
+
+                REQUIRED_FILES=(
+                  .pipelines/ism-k8s-replica/00-namespace.yaml
+                  .pipelines/ism-k8s-replica/01-deployments.yaml
+                  .pipelines/ism-k8s-replica/02-services.yaml
+                  .pipelines/ism-k8s-replica/03-ingress.yaml
+                  .pipelines/ism-k8s-replica/build-and-push-ism.sh
+                )
+                for file in "${REQUIRED_FILES[@]}"; do
+                  if [[ ! -s "$file" ]]; then
+                    echo "ERRO: arquivo obrigatório ausente no checkout da branch: $file" >&2
+                    echo "Commit/push a pasta .pipelines/ism-k8s-replica/ no repositório antes de executar a pipeline." >&2
+                    exit 1
+                  fi
+                done
+
+                ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+                EXPECTED_ACCOUNT="$(awsAccountId)"
+                AWS_REGION_VALUE="$(awsRegion)"
+                EKS_CLUSTER_VALUE="$(eksClusterName)"
+                if [[ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT" ]]; then
+                  echo "ERRO: AWS account atual=$ACCOUNT_ID; esperada=$EXPECTED_ACCOUNT." >&2
+                  exit 1
+                fi
+
+                aws eks describe-cluster --name "$EKS_CLUSTER_VALUE" --region "$AWS_REGION_VALUE" \
+                  --query 'cluster.status' --output text | grep -qx ACTIVE
+                aws eks update-kubeconfig --name "$EKS_CLUSTER_VALUE" --region "$AWS_REGION_VALUE"
+                EXPECTED_CONTEXT="arn:aws:eks:${AWS_REGION_VALUE}:${EXPECTED_ACCOUNT}:cluster/${EKS_CLUSTER_VALUE}"
+                CURRENT_CONTEXT="$(kubectl config current-context)"
+                if [[ "$CURRENT_CONTEXT" != "$EXPECTED_CONTEXT" ]]; then
+                  echo "ERRO: kubectl context=$CURRENT_CONTEXT; esperado=$EXPECTED_CONTEXT." >&2
+                  exit 1
+                fi
+
+                INGRESS_CONTROLLER="$(kubectl get ingressclass nginx -o jsonpath='{.spec.controller}')"
+                if [[ "$INGRESS_CONTROLLER" != 'k8s.io/ingress-nginx' ]]; then
+                  echo "ERRO: IngressClass nginx usa controller inesperado: $INGRESS_CONTROLLER" >&2
+                  exit 1
+                fi
+                if ! kubectl get clusterissuer letsencrypt-prod >/dev/null 2>&1; then
+                  echo "AVISO: ClusterIssuer letsencrypt-prod não encontrado; bootstrap prossegue, mas TLS precisará ser corrigido." >&2
+                fi
+
+                if kubectl get namespace ism >/dev/null 2>&1; then
+                  TENANT_LABEL="$(kubectl get namespace ism -o jsonpath='{.metadata.labels.tenant}')"
+                  if [[ "$TENANT_LABEL" != 'ism' ]]; then
+                    echo "ERRO: namespace ism existe sem tenant=ism; abortando para evitar assumir recurso alheio." >&2
+                    exit 1
+                  fi
+                fi
+                if kubectl get ingress ism-crm-ingress -n ism >/dev/null 2>&1; then
+                  OWNER="$(kubectl get ingress ism-crm-ingress -n ism -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}')"
+                  if [[ "$OWNER" != 'ism-k8s' ]]; then
+                    echo "ERRO: ism/ism-crm-ingress existe sem ownership ism-k8s; revisar manualmente." >&2
+                    exit 1
+                  fi
+                fi
+
+                export INGRESS_INVENTORY="$(kubectl get ingress -A -o json)"
+                python3 - <<'PY'
+                import json, os, sys
+                wanted = {
+                    'ism-crm.collectioncenter.com.br',
+                    'ism-api-crm.collectioncenter.com.br',
+                    'ism-webhooks-crm.collectioncenter.com.br',
+                }
+                data = json.loads(os.environ['INGRESS_INVENTORY'])
+                conflicts = []
+                def overlaps(existing, requested):
+                    if existing == '*' or existing == requested:
+                        return True
+                    if existing.startswith('*.'):
+                        suffix = existing[2:]
+                        return requested.endswith('.' + suffix) and requested.count('.') == suffix.count('.') + 1
+                    return False
+                for ing in data.get('items', []):
+                    meta = ing.get('metadata', {})
+                    ns, name = meta.get('namespace'), meta.get('name')
+                    # Solver Ingresses HTTP-01 do cert-manager são temporários e
+                    # precisam compartilhar o host durante a validação ACME.
+                    is_acme_solver = ns == 'ism' and name.startswith('cm-acme-http-solver-')
+                    if (ns == 'ism' and name == 'ism-crm-ingress') or is_acme_solver:
+                        continue
+                    for rule in ing.get('spec', {}).get('rules', []):
+                        host = rule.get('host')
+                        if host and any(overlaps(host, candidate) for candidate in wanted):
+                            conflicts.append(f'{ns}/{name}: {host}')
+                if conflicts:
+                    print('ERRO: hosts ISM já pertencem a outro Ingress:', file=sys.stderr)
+                    print('\n'.join(conflicts), file=sys.stderr)
+                    sys.exit(1)
+                PY
+
+                # Namespace pode não existir no primeiro deploy. Validar e aplicá-lo antes
+                # do dry-run de recursos namespaced; apply é idempotente para namespace existente.
+                kubectl apply --dry-run=server -f .pipelines/ism-k8s-replica/00-namespace.yaml
+                kubectl apply -f .pipelines/ism-k8s-replica/00-namespace.yaml
+                kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ism --timeout=60s
+                kubectl apply --dry-run=server -f .pipelines/ism-k8s-replica/02-services.yaml
+                kubectl apply --dry-run=server -f .pipelines/ism-k8s-replica/03-ingress.yaml
+                kubectl apply -f .pipelines/ism-k8s-replica/02-services.yaml
+                kubectl apply -f .pipelines/ism-k8s-replica/03-ingress.yaml
+                kubectl get namespace ism --show-labels
+                kubectl get services,ingress -n ism -o wide
+                echo 'Bootstrap ISM concluído. Ainda não há Deployments/Pods nesta etapa.'
+
+  - stage: EnsureISMECR
+    displayName: Ensure single ISM ECR repository
+    dependsOn: BootstrapISM
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/ism-prd'))
+    jobs:
+      - job: CreateRepository
+        displayName: Create ECR repository if missing
+        steps:
+          - task: AWSShellScript@1
+            displayName: Create encrypted, scan-on-push ECR repository
+            inputs:
+              awsCredentials: '$(awsCredentials)'
+              regionName: '$(awsRegion)'
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+                EXPECTED_ACCOUNT="$(awsAccountId)"
+                if [[ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT" ]]; then
+                  echo "ERRO: AWS account atual=$ACCOUNT_ID; esperada=$EXPECTED_ACCOUNT." >&2
+                  exit 1
+                fi
+                REPOSITORY='uze-crm-ism-prd'
+                if aws ecr describe-repositories --repository-names "$REPOSITORY" >/dev/null 2>&1; then
+                  echo "ECR existente: $REPOSITORY"
+                else
+                  aws ecr create-repository \
+                    --repository-name "$REPOSITORY" \
+                    --image-tag-mutability MUTABLE \
+                    --image-scanning-configuration scanOnPush=true \
+                    --encryption-configuration encryptionType=AES256 \
+                    --query 'repository.repositoryArn' --output text
+                fi
+
+  - stage: DetectChanges
+    displayName: Detect ISM component changes
+    dependsOn: BootstrapISM
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/ism-prd'))
+    jobs:
+      - job: DetectComponents
+        displayName: Compare with the previous successful ISM pipeline run
+        steps:
+          - checkout: self
+            fetchDepth: 0
+          - bash: |
+              set -euo pipefail
+              cd "$(Build.SourcesDirectory)"
+              python3 - <<'PY'
+              import json
+              import os
+              import subprocess
+              import urllib.parse
+              import urllib.request
+
+              current = os.environ['BUILD_SOURCEVERSION']
+              current_build_id = os.environ['SYSTEM_BUILDID']
+              token = os.environ.get('SYSTEM_ACCESSTOKEN', '')
+              collection = os.environ['SYSTEM_COLLECTIONURI']
+              project_id = os.environ['SYSTEM_TEAMPROJECTID']
+              definition_id = os.environ['SYSTEM_DEFINITIONID']
+              branch = os.environ['SYSTEM_SOURCEBRANCH']
+
+              def full_build(reason):
+                  print(f'AVISO: {reason}; execução segura com build dos três grupos de componentes.')
+                  return {'frontendChanged': True, 'backendChanged': True, 'boletoChanged': True}
+
+              try:
+                  if not token:
+                      raise RuntimeError('System.AccessToken indisponível para consultar a execução anterior')
+                  query = urllib.parse.urlencode({
+                      'definitions': definition_id,
+                      'branchName': branch,
+                      'statusFilter': 'completed',
+                      'resultFilter': 'succeeded',
+                      'queryOrder': 'finishTimeDescending',
+                      '$top': '50',
+                      'api-version': '7.1',
+                  })
+                  url = f"{collection}{project_id}/_apis/build/builds?{query}"
+                  request = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      builds = json.load(response).get('value', [])
+                  previous = next((b for b in builds if str(b.get('id')) != current_build_id and b.get('sourceVersion')), None)
+                  if previous is None:
+                      raise RuntimeError('nenhuma execução bem-sucedida anterior encontrada para esta definição e branch')
+                  base = previous['sourceVersion']
+                  exists = subprocess.run(['git', 'cat-file', '-e', f'{base}^{{commit}}'], capture_output=True)
+                  if exists.returncode != 0:
+                      raise RuntimeError('commit da última execução bem-sucedida não está no checkout')
+                  result = subprocess.run(
+                      ['git', 'diff', '--name-only', base, current],
+                      check=True, capture_output=True, text=True
+                  )
+                  changes = result.stdout.splitlines()
+                  print(f'Comparação concluída desde a execução bem-sucedida {previous["id"]}.')
+              except Exception as exc:
+                  flags = full_build(f'detecção incremental indisponível ({type(exc).__name__})')
+              else:
+                  frontend = backend = boleto = False
+                  rebuild_all = False
+                  for path in changes:
+                      if path.startswith('frontend/'):
+                          frontend = True
+                      elif path.startswith('backend/'):
+                          backend = True
+                      elif path.startswith('boleto-pdf-generator/'):
+                          boleto = True
+                      elif path in {
+                          '.pipelines/ism-k8s-replica/build-and-push-ism.sh',
+                          '.pipelines/ism-k8s-replica/azure-pipelines-ism-prd.yml',
+                      }:
+                          rebuild_all = True
+                      elif path in {
+                          'README.md',
+                          '.pipelines/ism-k8s-replica/00-namespace.yaml',
+                          '.pipelines/ism-k8s-replica/01-deployments.yaml',
+                          '.pipelines/ism-k8s-replica/02-services.yaml',
+                          '.pipelines/ism-k8s-replica/03-ingress.yaml',
+                          '.pipelines/ism-k8s-replica/README.md',
+                          '.pipelines/ism-k8s-replica/RUNBOOK-APLICACAO-ISM.md',
+                          '.pipelines/ism-k8s-replica/RUNBOOK-APLICACAO-ISM.pdf',
+                      } or path.startswith('docs/'):
+                          continue
+                      else:
+                          # Arquivo fora dos contextos mapeados pode ser dependência compartilhada.
+                          rebuild_all = True
+                  if rebuild_all:
+                      frontend = backend = boleto = True
+                  flags = {
+                      'frontendChanged': frontend,
+                      'backendChanged': backend,
+                      'boletoChanged': boleto,
+                  }
+                  if changes:
+                      print(f'Arquivos alterados analisados: {len(changes)}; nomes e conteúdos não são exibidos.')
+                  else:
+                      print('Nenhuma alteração desde a última execução bem-sucedida.')
+
+              for name, value in flags.items():
+                  print(f"##vso[task.setvariable variable={name};isOutput=true]{'true' if value else 'false'}")
+              print('Resumo de build: ' + ', '.join(f'{k}={str(v).lower()}' for k, v in flags.items()))
+              PY
+            name: detectChanges
+            displayName: Detect changed component paths
+            env:
+              BUILD_SOURCEVERSION: $(Build.SourceVersion)
+              SYSTEM_BUILDID: $(Build.BuildId)
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+              SYSTEM_TEAMPROJECTID: $(System.TeamProjectId)
+              SYSTEM_DEFINITIONID: $(System.DefinitionId)
+              SYSTEM_SOURCEBRANCH: $(Build.SourceBranch)
+
+  - stage: BuildFrontend
+    displayName: Build and push ISM frontend
+    dependsOn:
+      - EnsureISMECR
+      - DetectChanges
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/ism-prd'), or(${{ eq(parameters.deployWorkloads, true) }}, eq(dependencies.DetectChanges.outputs['DetectComponents.detectChanges.frontendChanged'], 'true')))
+    jobs:
+      - job: Frontend
+        steps:
+          - checkout: self
+          - task: AWSShellScript@1
+            displayName: Build and push frontend tag
+            inputs:
+              awsCredentials: '$(awsCredentials)'
+              regionName: '$(awsRegion)'
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                cd "$(Build.SourcesDirectory)"
+                bash .pipelines/ism-k8s-replica/build-and-push-ism.sh frontend
+            env:
+              BUILD_ID: $(Build.BuildId)
+              AWS_REGION: $(awsRegion)
+              AWS_ACCOUNT_ID: $(awsAccountId)
+              ECR_REPOSITORY: uze-crm-ism-prd
+              API_URL: $(ApiUrl)
+              MANUS_API_BASE_URL: $(ManusApi__BaseUrl)
+
+  - stage: BuildBackend
+    displayName: Compile and build/push ISM backend images
+    dependsOn:
+      - EnsureISMECR
+      - DetectChanges
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/ism-prd'), or(${{ eq(parameters.deployWorkloads, true) }}, eq(dependencies.DetectChanges.outputs['DetectComponents.detectChanges.backendChanged'], 'true')))
+    jobs:
+      - job: CompileBackend
+        steps:
+          - checkout: self
+          - template: dotnet/build.yml@devops-templates
+            parameters:
+              projectPath: backend
+
+      - job: DockerBackend
+        dependsOn: CompileBackend
+        steps:
+          - checkout: self
+          - task: AWSShellScript@1
+            displayName: Build and push four backend tags
+            inputs:
+              awsCredentials: '$(awsCredentials)'
+              regionName: '$(awsRegion)'
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                cd "$(Build.SourcesDirectory)"
+                bash .pipelines/ism-k8s-replica/build-and-push-ism.sh backend-all
+            env:
+              BUILD_ID: $(Build.BuildId)
+              AWS_REGION: $(awsRegion)
+              AWS_ACCOUNT_ID: $(awsAccountId)
+              ECR_REPOSITORY: uze-crm-ism-prd
+
+  - stage: BuildBoletoPdfGenerator
+    displayName: Build and push ISM boleto PDF generator
+    dependsOn:
+      - EnsureISMECR
+      - DetectChanges
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/ism-prd'), or(${{ eq(parameters.deployWorkloads, true) }}, eq(dependencies.DetectChanges.outputs['DetectComponents.detectChanges.boletoChanged'], 'true')))
+    jobs:
+      - job: DockerBoleto
+        steps:
+          - checkout: self
+          - task: AWSShellScript@1
+            displayName: Build and push boleto tag
+            inputs:
+              awsCredentials: '$(awsCredentials)'
+              regionName: '$(awsRegion)'
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                cd "$(Build.SourcesDirectory)"
+                bash .pipelines/ism-k8s-replica/build-and-push-ism.sh boleto
+            env:
+              BUILD_ID: $(Build.BuildId)
+              AWS_REGION: $(awsRegion)
+              AWS_ACCOUNT_ID: $(awsAccountId)
+              ECR_REPOSITORY: uze-crm-ism-prd
+
+  - stage: DeployISM
+    displayName: Deploy only the ISM namespace
+    dependsOn:
+      - BuildFrontend
+      - BuildBackend
+      - BuildBoletoPdfGenerator
+    condition: and(succeeded(), ${{ eq(parameters.deployWorkloads, true) }}, ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/ism-prd'))
+    jobs:
+      - job: Deploy
+        displayName: Validate artifacts and deploy ISM
+        steps:
+          - checkout: self
+          - task: KubectlInstaller@0
+            inputs:
+              kubectlVersion: '1.34.9'
+          - task: AWSShellScript@1
+            displayName: Validate ECR tags and apply workloads to namespace ism
+            inputs:
+              awsCredentials: '$(awsCredentials)'
+              regionName: '$(awsRegion)'
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                cd "$(Build.SourcesDirectory)"
+
+                ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+                EXPECTED_ACCOUNT="$(awsAccountId)"
+                AWS_REGION_VALUE="$(awsRegion)"
+                EKS_CLUSTER_VALUE="$(eksClusterName)"
+                BUILD_ID="$(Build.BuildId)"
+                if [[ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT" ]]; then
+                  echo "ERRO: AWS account atual=$ACCOUNT_ID; esperada=$EXPECTED_ACCOUNT." >&2
+                  exit 1
+                fi
+                aws eks update-kubeconfig --name "$EKS_CLUSTER_VALUE" --region "$AWS_REGION_VALUE"
+
+                REPOSITORY='uze-crm-ism-prd'
+                for component in front application webapi webhooks workers boleto; do
+                  image_tag="${component}-v${BUILD_ID}"
+                  aws ecr describe-images --region "$AWS_REGION_VALUE" \
+                    --repository-name "$REPOSITORY" --image-ids imageTag="$image_tag" >/dev/null
+                  echo "Imagem verificada: ${REPOSITORY}:${image_tag}"
+                done
+
+                # Requer secretsmanager:GetSecretValue para o ARN deste segredo e RBAC
+                # Kubernetes para criar/atualizar Secrets somente no namespace ism.
+                AWS_SECRET_ID='uze-collection-crm/ism'
+                umask 077
+                SECRET_TMP_DIR="$(mktemp -d)"
+                trap 'rm -rf "$SECRET_TMP_DIR"' EXIT
+                aws secretsmanager get-secret-value \
+                  --region "$AWS_REGION_VALUE" \
+                  --secret-id "$AWS_SECRET_ID" \
+                  --output json > "$SECRET_TMP_DIR/secret-response.json"
+
+                python3 - "$SECRET_TMP_DIR/secret-response.json" "$SECRET_TMP_DIR/ism-crm-secrets.json" <<'PY'
+                import base64
+                import json
+                import re
+                import sys
+                from pathlib import Path
+
+                response = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+                secret_string = response.get('SecretString')
+                if not isinstance(secret_string, str) or not secret_string:
+                    raise SystemExit('ERRO: segredo AWS sem SecretString textual; valor não exibido.')
+                try:
+                    payload = json.loads(secret_string)
+                except json.JSONDecodeError:
+                    payload = secret_string
+                settings = {}
+
+                def flatten(prefix, value):
+                    if isinstance(value, dict):
+                        for key, child in value.items():
+                            name = f'{prefix}__{key}' if prefix else str(key)
+                            flatten(name, child)
+                    elif isinstance(value, list):
+                        for index, child in enumerate(value):
+                            name = f'{prefix}__{index}' if prefix else str(index)
+                            flatten(name, child)
+                    elif value is not None and prefix:
+                        if isinstance(value, bool):
+                            settings[prefix] = 'true' if value else 'false'
+                        else:
+                            settings[prefix] = str(value)
+
+                if isinstance(payload, dict):
+                    flatten('', payload)
+                elif isinstance(payload, str):
+                    settings['ConnectionStrings__Default'] = payload
+                else:
+                    raise SystemExit('ERRO: formato do segredo AWS não suportado; valor não exibido.')
+
+                connection_string = settings.get('ConnectionStrings__Default')
+                if not isinstance(connection_string, str) or not connection_string.strip():
+                    raise SystemExit('ERRO: JSON precisa conter ConnectionStrings.Default ou ConnectionStrings__Default; valor não exibido.')
+                invalid_keys = [key for key in settings if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)]
+                if invalid_keys:
+                    raise SystemExit('ERRO: nomes de configuração incompatíveis com variáveis de ambiente; valores não exibidos.')
+
+                secret = {
+                    'apiVersion': 'v1',
+                    'kind': 'Secret',
+                    'metadata': {'name': 'ism-crm-secrets', 'namespace': 'ism'},
+                    'type': 'Opaque',
+                    'data': {
+                        key: base64.b64encode(value.encode('utf-8')).decode('ascii')
+                        for key, value in settings.items()
+                    },
+                }
+                Path(sys.argv[2]).write_text(json.dumps(secret), encoding='utf-8')
+                PY
+
+                echo 'Configuração ISM do Secrets Manager convertida em manifesto Kubernetes temporário; valores não exibidos.'
+
+                BUILD_ID="$BUILD_ID" python3 - <<'PY'
+                import os
+                from pathlib import Path
+                source = Path('.pipelines/ism-k8s-replica/01-deployments.yaml')
+                output = Path('$(Agent.TempDirectory)/01-deployments-ism.yaml')
+                marker = '$' + '(Build.BuildId)'
+                content = source.read_text()
+                if marker not in content:
+                    raise SystemExit('ERRO: macro Build.BuildId não encontrada nos Deployments.')
+                rendered = content.replace(marker, os.environ['BUILD_ID'])
+                if marker in rendered:
+                    raise SystemExit('ERRO: restou macro Build.BuildId sem renderização.')
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(rendered)
+                print(f'Manifests renderizados para Build ID {os.environ["BUILD_ID"]}; nenhum segredo foi impresso.')
+                PY
+
+                RENDERED_DEPLOYMENTS="$(Agent.TempDirectory)/01-deployments-ism.yaml"
+                kubectl apply --dry-run=server -f .pipelines/ism-k8s-replica/00-namespace.yaml
+                kubectl apply --dry-run=server -f .pipelines/ism-k8s-replica/02-services.yaml
+                kubectl apply --dry-run=server -f "$RENDERED_DEPLOYMENTS"
+                kubectl apply --dry-run=server -f .pipelines/ism-k8s-replica/03-ingress.yaml
+                kubectl apply --dry-run=server -f "$SECRET_TMP_DIR/ism-crm-secrets.json"
+
+                kubectl apply -f .pipelines/ism-k8s-replica/00-namespace.yaml
+                kubectl apply -f .pipelines/ism-k8s-replica/02-services.yaml
+                kubectl apply -f "$SECRET_TMP_DIR/ism-crm-secrets.json"
+                echo 'Secret Kubernetes ism-crm-secrets sincronizado; valor não exibido.'
+                kubectl apply -f "$RENDERED_DEPLOYMENTS"
+                kubectl apply -f .pipelines/ism-k8s-replica/03-ingress.yaml
+
+                for deployment in \
+                  ism-crm-front \
+                  ism-crm-application \
+                  ism-crm-webapi \
+                  ism-crm-webhooks \
+                  ism-crm-workers \
+                  ism-crm-boleto-pdf-generator; do
+                  kubectl rollout status "deployment/${deployment}" -n ism --timeout=300s
+                done
+                kubectl get deployments,pods,services,ingress -n ism -o wide
